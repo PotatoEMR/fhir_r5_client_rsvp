@@ -1,46 +1,21 @@
 ////[https://hl7.org/fhir/r5](https://hl7.org/fhir/r5) r5 client using rsvp
 
 import fhir/r5/resources
-import fhir/r5/sansio
+import fhir/r5/sansio.{type FhirClient}
 import fhir/r5/search_params
 import gleam/dynamic/decode.{type Decoder}
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
+import gleam/io
 import gleam/json.{type Json}
+import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/string
 import lustre/effect.{type Effect}
 import rsvp
 
-/// FHIR client for sending http requests to server such as
-/// `let read_pat_effect = fhirclient_rsvp.patient_read("123", client, msg)`
-///
-/// create client from server base url with fhirclient_new(baseurl)`
-///
-/// `let assert Ok(client) = fhirclient_rsvp.fhirclient_new("r4.smarthealthit.org/")`
-///
-/// `let assert Ok(client) = fhirclient_rsvp.fhirclient_new("https://r4.smarthealthit.org/")`
-///
-/// `let assert Ok(client) = fhirclient_rsvp.fhirclient_new("https://hapi.fhir.org/baseR4")`
-///
-/// `let assert Ok(client) = fhirclient_rsvp.fhirclient_new("127.0.0.1:8000")`
-pub type FhirClient =
-  sansio.FhirClient
-
-/// creates a new client from server base url
-///
-/// `let assert Ok(client) = fhirclient_rsvp.fhirclient_new("r4.smarthealthit.org/")`
-///
-/// `let assert Ok(client) = fhirclient_rsvp.fhirclient_new("https://r4.smarthealthit.org/")`
-///
-/// `let assert Ok(client) = fhirclient_rsvp.fhirclient_new("https://hapi.fhir.org/baseR4")`
-///
-/// `let assert Ok(client) = fhirclient_rsvp.fhirclient_new("127.0.0.1:8000")`
-pub fn fhirclient_new(baseurl: String) -> Result(FhirClient, sansio.ErrBaseUrl) {
-  sansio.fhirclient_new(baseurl)
-}
-
 pub type Err {
-  ErrRsvp(err: rsvp.Error)
+  ErrRsvp(err: rsvp.Error(String))
   ErrSansio(err: sansio.ErrResp)
 }
 
@@ -59,7 +34,7 @@ fn any_create(
   handle_response: fn(Result(r, Err)) -> a,
 ) -> Effect(a) {
   let req = sansio.any_create_req(resource, res_type, client)
-  sendreq_handleresponse(req, resource_dec, res_type, handle_response)
+  sendreq_handleresponse(req, resource_dec, res_type, handle_response, client)
 }
 
 fn any_read(
@@ -70,7 +45,7 @@ fn any_read(
   handle_response: fn(Result(r, Err)) -> a,
 ) -> Effect(a) {
   let req = sansio.any_read_req(id, res_type, client)
-  sendreq_handleresponse(req, resource_dec, res_type, handle_response)
+  sendreq_handleresponse(req, resource_dec, res_type, handle_response, client)
 }
 
 fn any_update(
@@ -84,7 +59,13 @@ fn any_update(
   let req = sansio.any_update_req(id, resource, res_type, client)
   case req {
     Ok(req) ->
-      Ok(sendreq_handleresponse(req, resource_dec, res_type, handle_response))
+      Ok(sendreq_handleresponse(
+        req,
+        resource_dec,
+        res_type,
+        handle_response,
+        client,
+      ))
     // from rsvp's point of view it would make more sense to split sansio error into 2 separate errors
     // since user creates request and gets effect or error, then sends and gets response or error
     // ie you know first error must be creating error, and second must be http or parsing error
@@ -101,7 +82,20 @@ pub fn any_delete(
   handle_response: fn(Result(sansio.OperationoutcomeOrHTTP, Err)) -> a,
 ) -> Effect(a) {
   let req = sansio.any_delete_req(id, res_type, client)
-  let handle_read = fn(resp_res: Result(Response(String), rsvp.Error)) {
+  case client.print_sent_requests {
+    sansio.LoggingOn -> req |> sansio.req_to_string |> io.println
+    sansio.LoggingOff -> Nil
+  }
+  let handle_read = fn(resp_res: Result(Response(String), rsvp.Error(String))) {
+    case client.print_received_responses {
+      sansio.LoggingOn ->
+        case resp_res {
+          Ok(resp) -> resp |> sansio.resp_to_string
+          Error(err) -> err |> rsvp_err_to_string
+        }
+        |> io.println
+      sansio.LoggingOff -> Nil
+    }
     handle_response(case resp_res {
       Error(err) -> Error(ErrRsvp(err))
       Ok(resp) ->
@@ -133,6 +127,7 @@ pub fn search_any(
     resources.bundle_decoder(),
     resources.RtBundle,
     handle_response,
+    client,
   )
 }
 
@@ -150,6 +145,7 @@ pub fn search_any_forgiving(
     resources.bundle_decoder_forgiving(),
     resources.RtBundle,
     handle_response,
+    client,
   )
 }
 
@@ -166,7 +162,13 @@ pub fn operation_any(
 ) -> Effect(msg) {
   let req =
     sansio.any_operation_req(res_type, res_id, operation_name, params, client)
-  sendreq_handleresponse(req, res_decoder, return_res_type, handle_response)
+  sendreq_handleresponse(
+    req,
+    res_decoder,
+    return_res_type,
+    handle_response,
+    client,
+  )
 }
 
 pub fn batch(
@@ -181,6 +183,7 @@ pub fn batch(
     resources.bundle_decoder(),
     resources.RtBundle,
     handle_response,
+    client,
   )
 }
 
@@ -189,6 +192,7 @@ fn sendreq_handleresponse(
   res_dec: Decoder(r),
   res_type: resources.ResourceType,
   handle_response: fn(Result(r, Err)) -> a,
+  client: FhirClient,
 ) -> Effect(a) {
   sendreq_handleresponse_andprocess(
     req,
@@ -196,6 +200,7 @@ fn sendreq_handleresponse(
     res_type,
     handle_response,
     fn(a) { a },
+    client,
   )
 }
 
@@ -205,8 +210,22 @@ fn sendreq_handleresponse_andprocess(
   res_type: resources.ResourceType,
   handle_response: fn(Result(b, Err)) -> a,
   process_res: fn(r) -> b,
+  client: FhirClient,
 ) -> Effect(a) {
-  let handle_read = fn(resp_res: Result(Response(String), rsvp.Error)) {
+  case client.print_sent_requests {
+    sansio.LoggingOn -> req |> sansio.req_to_string |> io.println
+    sansio.LoggingOff -> Nil
+  }
+  let handle_read = fn(resp_res: Result(Response(String), rsvp.Error(String))) {
+    case client.print_received_responses {
+      sansio.LoggingOn ->
+        case resp_res {
+          Ok(resp) -> resp |> sansio.resp_to_string
+          Error(err) -> err |> rsvp_err_to_string
+        }
+        |> io.println
+      sansio.LoggingOff -> Nil
+    }
     handle_response(case resp_res {
       Error(err) -> Error(ErrRsvp(err))
       Ok(resp_res) -> {
@@ -224,6 +243,37 @@ fn sendreq_handleresponse_andprocess(
     Some(body) -> json.to_string(body)
   })
   |> rsvp.send(handler)
+}
+
+fn rsvp_err_to_string(err: rsvp.Error(String)) -> String {
+  case err {
+    rsvp.BadBody -> "invalid http response body"
+    rsvp.BadUrl(url) -> "invalid url: " <> url
+    rsvp.HttpError(resp) -> "resp not 2xx: " <> sansio.resp_to_string(resp)
+    rsvp.JsonError(err) ->
+      "err decoding json: "
+      <> case err {
+        json.UnexpectedEndOfInput -> "unexpected end of input"
+        json.UnexpectedByte(err) -> "unexpected byte: " <> err
+        json.UnexpectedSequence(err) -> "unexpected sequence " <> err
+        json.UnableToDecode(errors) ->
+          "unable to decode: "
+          <> list.map(errors, fn(error) {
+            "expected "
+            <> error.expected
+            <> " but found "
+            <> error.found
+            <> " at "
+            <> string.join(error.path, "/")
+          })
+          |> string.join("\n")
+      }
+    rsvp.NetworkError ->
+      "network error, http request could not connect to server"
+    rsvp.UnhandledResponse(resp) ->
+      "rsvp handler does not know how to handle response: "
+      <> sansio.resp_to_string(resp)
+  }
 }
 
 pub fn account_create(
